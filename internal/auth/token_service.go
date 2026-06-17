@@ -23,6 +23,23 @@ type TokenService struct {
 	refreshTokenExpiry time.Duration
 }
 
+// tokenOpTimeout bounds a detached token operation.
+const tokenOpTimeout = 10 * time.Second
+
+// detachedTokenContext returns a context for a refresh-token operation that
+// survives cancellation of the originating request.
+//
+// Login and refresh handlers pass c.Request.Context(); if the client
+// disconnects or retries mid-operation, that context is canceled and the
+// session lookup or write fails with "context canceled" — the user is either
+// not logged in or, mid-rotation, logged out (#560). Once the server has
+// committed to issuing/rotating tokens the operation must run to completion, so
+// we detach from the request's cancellation (keeping its values for
+// logging/tracing) and apply our own timeout to stay bounded.
+func detachedTokenContext(parent context.Context) (context.Context, context.CancelFunc) {
+	return context.WithTimeout(context.WithoutCancel(parent), tokenOpTimeout)
+}
+
 // TokenResponse represents the response containing both access and refresh tokens
 type TokenResponse struct {
 	AccessToken        string    `json:"access_token"`
@@ -85,7 +102,9 @@ func (s *TokenService) GenerateTokens(ctx context.Context, user *uModel.UserDeta
 		ExpiresAt: refreshTokenExpiry,
 	}
 
-	if err := s.userRepo.CreateUserSession(ctx, userSession); err != nil {
+	writeCtx, cancel := detachedTokenContext(ctx)
+	defer cancel()
+	if err := s.userRepo.CreateUserSession(writeCtx, userSession); err != nil {
 		return nil, fmt.Errorf("failed to store refresh token: %w", err)
 	}
 
@@ -103,6 +122,12 @@ func (s *TokenService) GenerateTokens(ctx context.Context, user *uModel.UserDeta
 
 // RefreshTokens validates refresh token and generates new token pair
 func (s *TokenService) RefreshTokens(ctx context.Context, refreshToken string) (*TokenResponse, error) {
+	// Run the whole rotation on a context detached from the request: once we
+	// start validating/rotating, a client disconnect must not abort us partway
+	// and leave the user without a usable refresh token (#560).
+	ctx, cancel := detachedTokenContext(ctx)
+	defer cancel()
+
 	// Hash the provided refresh token
 	tokenHash := s.hashToken(refreshToken)
 
@@ -117,11 +142,6 @@ func (s *TokenService) RefreshTokens(ctx context.Context, refreshToken string) (
 		// Token reuse detected - revoke entire family
 		_ = s.userRepo.RevokeSessionFamily(ctx, session.FamilyID)
 		return nil, fmt.Errorf("token reuse detected - please login again")
-	}
-
-	// Mark current token as used
-	if err := s.userRepo.MarkSessionUsed(ctx, session.ID); err != nil {
-		return nil, fmt.Errorf("failed to mark token as used: %w", err)
 	}
 
 	// Get user details for new token generation
@@ -163,8 +183,18 @@ func (s *TokenService) RefreshTokens(ctx context.Context, refreshToken string) (
 		ExpiresAt: refreshTokenExpiry,
 	}
 
+	// Persist the new session BEFORE burning the old token. If we marked the
+	// old token used first and the new write then failed (transient DB error),
+	// the user would be left with no valid refresh token and get logged out.
+	// Storing the new session first means a failure here leaves the old token
+	// usable for a retry.
 	if err := s.userRepo.CreateUserSession(ctx, newSession); err != nil {
 		return nil, fmt.Errorf("failed to store new refresh token: %w", err)
+	}
+
+	// New session is durable; now invalidate the old token to complete rotation.
+	if err := s.userRepo.MarkSessionUsed(ctx, session.ID); err != nil {
+		return nil, fmt.Errorf("failed to mark token as used: %w", err)
 	}
 
 	return &TokenResponse{
