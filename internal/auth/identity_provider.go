@@ -2,15 +2,47 @@ package auth
 
 import (
 	"context"
+	"crypto/tls"
 	"encoding/json"
 	"errors"
 	"io"
 	"net/http"
 	"strings"
+	"time"
 
 	"donetick.com/core/config"
 	"golang.org/x/oauth2"
 )
+
+// oauth2HTTPTimeout bounds OIDC token-exchange and userinfo calls so a stuck
+// IdP can never hang a login request indefinitely.
+const oauth2HTTPTimeout = 30 * time.Second
+
+// oauth2HTTPClient returns the HTTP client used for all outbound OIDC calls
+// (token exchange, userinfo, profile-picture validation).
+//
+// HTTP/2 is disabled and a hard timeout is enforced: several IdPs fronted by
+// Cloudflare leave Go's default HTTP/2 client hanging on the token POST while
+// a plain HTTP/1.1 request (e.g. `wget`) completes instantly (#671). Forcing
+// HTTP/1.1 plus a timeout makes the exchange reliable and bounded.
+func oauth2HTTPClient() *http.Client {
+	return oauth2HTTPClientWithTimeout(oauth2HTTPTimeout)
+}
+
+func oauth2HTTPClientWithTimeout(timeout time.Duration) *http.Client {
+	transport := &http.Transport{
+		Proxy:             http.ProxyFromEnvironment,
+		ForceAttemptHTTP2: false,
+		// A non-nil (but empty) TLSNextProto map disables the automatic HTTP/2
+		// upgrade, pinning connections to HTTP/1.1.
+		TLSNextProto:          map[string]func(authority string, c *tls.Conn) http.RoundTripper{},
+		MaxIdleConns:          10,
+		IdleConnTimeout:       90 * time.Second,
+		TLSHandshakeTimeout:   10 * time.Second,
+		ExpectContinueTimeout: 1 * time.Second,
+	}
+	return &http.Client{Timeout: timeout, Transport: transport}
+}
 
 type IdentityProviderUserInfo struct {
 	Identifier  string
@@ -59,6 +91,8 @@ func (i *IdentityProvider) ExchangeToken(ctx context.Context, code string, redir
 		},
 	}
 
+	// Use an HTTP/1.1 client with a timeout for the token POST (#671).
+	ctx = context.WithValue(ctx, oauth2.HTTPClient, oauth2HTTPClient())
 	token, err := conf.Exchange(ctx, code)
 	if err != nil {
 		// Enhanced error handling for OAuth2 errors
@@ -83,7 +117,7 @@ func (i *IdentityProvider) ExchangeToken(ctx context.Context, code string, redir
 }
 
 func (i *IdentityProvider) GetUserInfo(ctx context.Context, accessToken string) (*IdentityProviderUserInfo, error) {
-	req, err := http.NewRequest("GET", i.config.UserInfoURL, nil)
+	req, err := http.NewRequestWithContext(ctx, "GET", i.config.UserInfoURL, nil)
 	if err != nil {
 		return nil, err
 	}
@@ -91,7 +125,7 @@ func (i *IdentityProvider) GetUserInfo(ctx context.Context, accessToken string) 
 	req.Header.Set("Authorization", "Bearer "+accessToken)
 	req.Header.Set("Accept", "application/json")
 
-	resp, err := http.DefaultClient.Do(req)
+	resp, err := oauth2HTTPClient().Do(req)
 	if err != nil {
 		return nil, err
 	}
@@ -140,7 +174,8 @@ func (i *IdentityProvider) GetUserInfo(ctx context.Context, accessToken string) 
 
 // Check if the provided URL is reachable and returns a valid image
 func isPictureURLValid(url string) bool {
-	resp, err := http.Get(url)
+	// Bounded client so a slow/hanging image host can't stall OIDC login.
+	resp, err := oauth2HTTPClient().Get(url)
 	if err != nil {
 		return false
 	}
